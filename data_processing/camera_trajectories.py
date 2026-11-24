@@ -62,7 +62,7 @@ def camera_intrinsics_from_mapping(data: Mapping[str, Any], label: str) -> dict[
     for key in REQUIRED_INTRINSIC_KEYS:
         assert key in data, f"{label} is missing required camera intrinsic {key!r}"
         value = data[key]
-        assert isinstance(value, int | float) and not isinstance(
+        assert isinstance(value, (int, float)) and not isinstance(
             value, bool
         ), f"{label} camera intrinsic {key!r} must be numeric, got {value!r}"
         intrinsics[key] = int(value) if key in ("w", "h") else float(value)
@@ -72,7 +72,7 @@ def camera_intrinsics_from_mapping(data: Mapping[str, Any], label: str) -> dict[
 
     for key in DISTORTION_KEYS:
         value = data.get(key, 0.0)
-        assert isinstance(value, int | float) and not isinstance(
+        assert isinstance(value, (int, float)) and not isinstance(
             value, bool
         ), f"{label} camera intrinsic {key!r} must be numeric, got {value!r}"
         intrinsics[key] = float(value)

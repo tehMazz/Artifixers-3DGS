@@ -12,6 +12,14 @@ Adapted from ArtiFixer's data_processing/artifixer3d.py, minus the 3DGUT trainin
            see FastGS train.py --lpips_images).
   plus     render the PLY the trainer produced on every frame of the prepared split and write
            split_artifixer3d_plus.json for the second ArtiFixer pass (ArtiFixer3D+).
+  removal_handoff
+           object removal (ArtiFixer's output/jobs/build_af3d_split.py + handoff): every image is the
+           object-free composite of artifixer_gs.propagate at its photo pose; anchors = every
+           --anchor_every-th frame + the seeds (L1 + D-SSIM), the rest are listed in
+           generated_images.txt (LPIPS only). Also writes split.json + transforms.json there, the
+           ArtiFixer3D split that `plus` reads (val_frames = the non-anchors, as the 3DGUT AF3D+).
+           points3D.bin is copied as is (ArtiFixer does the same), or without the points inside the
+           removed object's hull with --drop_points_mask.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ import argparse
 import json
 import shutil
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,7 +37,8 @@ from PIL import Image as PILImage
 from scipy.spatial.transform import Rotation
 
 from artifixer_gs.colmap import CAMERA_MODEL_NAMES, Camera, read_colmap_extrinsics_binary, read_colmap_intrinsics_binary
-from artifixer_gs.render import render_ply
+from artifixer_gs.removal import parse_frame_ranges, points_in_hull
+from artifixer_gs.render import DISTORTION_KEYS, check_pinhole, render_ply
 from data_processing.camera_trajectories import (
     applied_transform_matrix,
     camera_intrinsics_for_frame,
@@ -113,7 +123,7 @@ def pinhole_from_colmap(camera_id: int, camera: Camera, image_size: tuple[int, i
         fx, fy, cx, cy, *distortion = camera.params
     else:
         assert False, f"Unsupported COLMAP camera model: {camera.model}"
-    assert not any(distortion), f"Camera {camera.id} has distortion {distortion}; undistort the scene first"
+    check_pinhole(distortion, f"COLMAP camera {camera.id} ({camera.model})")
     return pinhole_camera(camera_id, image_size[0], image_size[1], fx * sx, fy * sy, cx * sx, cy * sy)
 
 
@@ -201,7 +211,7 @@ def handoff(scene: PreparedScene, artifixer_frames_dir: Path, output_dir: Path) 
             (output_dir / "images" / name).symlink_to(source.resolve())
         else:
             intrinsics = camera_intrinsics_for_frame(transforms, frame)
-            assert not any(intrinsics[key] for key in ("k1", "k2", "p1", "p2")), f"Frame {index} has lens distortion"
+            check_pinhole([intrinsics[key] for key in DISTORTION_KEYS], f"frame {index}")
             camera = pinhole_camera(
                 len(cameras) + 1, intrinsics["w"], intrinsics["h"], intrinsics["fl_x"], intrinsics["fl_y"], intrinsics["cx"], intrinsics["cy"]
             )
@@ -220,6 +230,121 @@ def handoff(scene: PreparedScene, artifixer_frames_dir: Path, output_dir: Path) 
     print(
         f"Wrote {output_dir}: {len(selected)} photos + {len(generated_names)} ArtiFixer frames, "
         f"{len(cameras)} camera(s); LPIPS-only list {output_dir / GENERATED_IMAGES_FILENAME}",
+        flush=True,
+    )
+    return output_dir
+
+
+def filter_points3d(source: Path, target: Path, keep: Callable[[np.ndarray], np.ndarray]) -> tuple[int, int]:
+    """Copy a COLMAP points3D.bin, keeping the points whose xyz [M,3] keep() marks (tracks copied raw)."""
+    with source.open("rb") as fid:
+        count = struct.unpack("<Q", fid.read(8))[0]
+        records, xyzs = [], []
+        for _ in range(count):
+            head = fid.read(43)
+            track_length = struct.unpack("<Q", fid.read(8))[0]
+            records.append(head + struct.pack("<Q", track_length) + fid.read(8 * track_length))
+            xyzs.append(struct.unpack("<ddd", head[8:32]))
+    mask = keep(np.asarray(xyzs, dtype=np.float64).reshape(-1, 3)) if count else np.zeros(0, dtype=bool)
+    with target.open("wb") as fid:
+        fid.write(struct.pack("<Q", int(mask.sum())))
+        for record, kept in zip(records, mask):
+            if kept:
+                fid.write(record)
+    return count, int(mask.sum())
+
+
+def removal_handoff(
+    removal_split: Path,
+    propagated_dir: Path,
+    output_dir: Path,
+    anchor_every: int = 3,
+    seed_frames: str | None = None,
+    drop_points_mask: bool = False,
+) -> Path:
+    """FastGS scene of the propagated composites + the ArtiFixer3D split (anchors = every k-th + seeds)."""
+    (scene_id, entry), = json.loads(removal_split.read_text())["test"].items()
+    scene_root = Path(entry.get("scene_root", removal_split.parent / "scene"))
+    (_, scene_entry), = json.loads((scene_root / "split.json").read_text())["test"].items()
+    transforms = json.loads((scene_root / scene_entry["transforms_path"]).read_text())
+    frames = transforms["frames"]
+    photo_root = scene_root / scene_entry["image_root"]
+    applied_transform = applied_transform_matrix(transforms)
+    if seed_frames is None:
+        seeds = [int(i) for i, r in json.loads((propagated_dir / "order.json").read_text()).items() if r == 0]
+    else:
+        seeds = parse_frame_ranges(seed_frames)
+    assert anchor_every >= 1, "--anchor_every must be >= 1"
+    anchors = sorted(set(range(0, len(frames), anchor_every)) | set(seeds))
+    assert max(anchors) < len(frames), f"seed frames {seeds} outside the {len(frames)} frames"
+    missing = [i for i in range(len(frames)) if not (propagated_dir / "anchors" / f"{i:05d}.png").is_file()]
+    assert not missing, f"Missing composites in {propagated_dir / 'anchors'}: {missing[:10]} ({len(missing)} missing)"
+
+    sparse_dir = photo_root / "sparse" / "0"
+    source_images = {Path(image.name).name: image for image in read_colmap_extrinsics_binary(sparse_dir / "images.bin")}
+    source_cameras = read_colmap_intrinsics_binary(sparse_dir / "cameras.bin")
+    if output_dir.exists():
+        assert output_dir.is_dir() and not output_dir.is_symlink(), f"Expected a directory: {output_dir}"
+        shutil.rmtree(output_dir)
+    (output_dir / "images").mkdir(parents=True)
+    (output_dir / "sparse" / "0").mkdir(parents=True)
+
+    anchor_set = set(anchors)
+    cameras: list[Camera] = []
+    camera_ids: dict[tuple, int] = {}
+    images, generated_names, af3d_frames = [], [], []
+    for index, frame in enumerate(frames):
+        name = Path(str(frame["file_path"])).name
+        assert name in source_images, f"Frame {index} ({name}) is not in {sparse_dir / 'images.bin'}"
+        source_image = source_images[name]
+        intrinsics = camera_intrinsics_for_frame(transforms, frame)
+        size = (int(intrinsics["w"]), int(intrinsics["h"]))
+        camera = pinhole_from_colmap(len(cameras) + 1, source_cameras[source_image.camera_id], size)
+        # Every frame is a photo pose: keep the source COLMAP pose, checked against the split pose.
+        w2c = opengl_c2w_to_opencv_w2c(frame["transform_matrix"], applied_transform)
+        error = (Rotation.from_quat(np.roll(colmap_qvec(w2c[:3, :3]), -1)) * Rotation.from_quat(np.roll(source_image.qvec, -1)).inv()).magnitude()
+        assert np.degrees(error) < POSE_TOLERANCE_DEGREES and np.linalg.norm(w2c[:3, 3] - source_image.tvec) < POSE_TOLERANCE_TRANSLATION, (
+            f"Frame {index} ({name}) does not match its COLMAP pose; regenerate the removal split"
+        )
+        image_name = f"frame_{index:05d}.png"
+        link_or_resize(propagated_dir / "anchors" / f"{index:05d}.png", output_dir / "images" / image_name, size)
+        if index not in anchor_set:
+            generated_names.append(image_name)
+        camera_id = shared_camera_id(cameras, camera_ids, camera)
+        images.append((index + 1, source_image.qvec, source_image.tvec, camera_id, image_name))
+        af3d_frames.append({**frame, "file_path": f"images/{image_name}"})
+
+    write_cameras(output_dir / "sparse" / "0" / "cameras.bin", cameras)
+    write_images(output_dir / "sparse" / "0" / "images.bin", images)
+    points_source = (sparse_dir / "points3D.bin").resolve()
+    if drop_points_mask:
+        removal_dir = Path(entry.get("removal_dir", ""))
+        hull_points = np.load(removal_dir / "hull_points.npy").astype(np.float64)
+        margin = float(json.loads((removal_dir / "removal.json").read_text())["hull_margin"])
+        total, kept = filter_points3d(
+            points_source, output_dir / "sparse" / "0" / "points3D.bin", lambda xyz: ~points_in_hull(xyz, hull_points, margin)
+        )
+        print(f"points3D.bin: dropped {total - kept}/{total} points inside the removed object's hull", flush=True)
+    else:
+        shutil.copyfile(points_source, output_dir / "sparse" / "0" / "points3D.bin")
+    (output_dir / GENERATED_IMAGES_FILENAME).write_text("\n".join(generated_names) + "\n")
+    write_json(output_dir / "selected_indices.json", anchors)
+    (output_dir / "transforms.json").write_text(json.dumps({**transforms, "frames": af3d_frames}, indent=2))
+    prompt_path = Path(scene_entry["prompt_path"])
+    af3d_entry = {
+        "scene_id": scene_id,
+        "transforms_path": "transforms.json",
+        "image_root": ".",
+        "selected_indices_path": "selected_indices.json",
+        "prompt_path": str((prompt_path if prompt_path.is_absolute() else scene_root / prompt_path).resolve()),
+        "camera_scale": entry["camera_scale"],
+        "metric_scale": entry.get("metric_scale"),
+        "has_gt": False,
+    }
+    write_json(output_dir / "split.json", {"test": {scene_id: af3d_entry}})
+    print(
+        f"Wrote {output_dir}: {len(anchors)} anchor composites + {len(generated_names)} LPIPS-only composites, "
+        f"{len(cameras)} camera(s); ArtiFixer3D split {output_dir / 'split.json'}",
         flush=True,
     )
     return output_dir
@@ -269,8 +394,22 @@ def main() -> None:
     p.add_argument("--render_dir", type=Path, required=True)
     p.add_argument("--output_split", type=Path, required=True)
     p.add_argument("--scene_id", default=None)
+    r = sub.add_parser("removal_handoff", help="FastGS scene + ArtiFixer3D split from the propagated removal composites.")
+    r.add_argument("--removal_split", type=Path, required=True, help="split.json of artifixer_gs.removal split.")
+    r.add_argument("--propagated_dir", type=Path, required=True, help="artifixer_gs.propagate output (anchors/, order.json).")
+    r.add_argument("--output_dir", type=Path, required=True)
+    r.add_argument("--anchor_every", type=int, default=3)
+    r.add_argument("--seed_frames", default=None, help="Extra anchors, e.g. '0-6'; default: the seeds in order.json.")
+    r.add_argument("--drop_points_mask", action="store_true",
+                   help="Drop the COLMAP points inside the removed object's hull from the initialisation.")
     args = parser.parse_args()
 
+    if args.command == "removal_handoff":
+        removal_handoff(
+            args.removal_split.resolve(), args.propagated_dir.resolve(), args.output_dir.resolve(),
+            args.anchor_every, args.seed_frames, args.drop_points_mask,
+        )
+        return
     scene = load_prepared_scene(args.split_path, args.scene_id)
     if args.command == "handoff":
         handoff(scene, args.artifixer_frames_dir.resolve(), args.output_dir.resolve())

@@ -10,6 +10,13 @@
 Any method that writes the INRIA 3DGS PLY (3DGS, FastGS, Taming-3DGS, ...) works. gsplat does the
 rasterization. If gsplat is not importable here, the render runs in the interpreter named by
 GS_RENDER_PY (a Python with torch + gsplat) with this repo on PYTHONPATH.
+RENDER_CMD replaces gsplat with another renderer of the same contract, run in RENDER_CWD (default: this repo) with
+this repo on PYTHONPATH as `$RENDER_CMD --ply P --trajectory T --out_dir D [--depth]`; e.g. a Gaussian Wrapping PLY
+with GW's own rasterizer: RENDER_CMD="python gaussian_wrapping/render_ply_frames.py", RENDER_CWD=<GW repo>.
+
+eps2d (--eps2d, else the EPS2D environment variable, else gsplat's 0.3) is the screen-space low-pass added to
+every 2D covariance: 0.3 for 3DGS / FastGS PLYs, 0 for PLYs whose rasterizer adds none (Gaussian Wrapping, with
+its 3D filter baked into the PLY).
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ import argparse
 import json
 import os
 import shutil
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -34,7 +42,24 @@ from data_processing.camera_trajectories import (
 
 RENDER_FRAME_DIRS = ("renders", "opacity")
 DISTORTION_KEYS = ("k1", "k2", "p1", "p2")
+
+
+def check_pinhole(distortion, what: str) -> None:
+    """Lens distortion is an error, unless IGNORE_DISTORTION=1: the PLY was trained with it dropped (Gaussian Wrapping
+    reads SIMPLE_RADIAL / RADIAL / OPENCV cameras as pinhole), so rendering and distilling as pinhole matches it."""
+    if not any(distortion):
+        return
+    assert os.environ.get("IGNORE_DISTORTION") == "1", (
+        f"{what} has lens distortion {list(distortion)}; 3DGS renders pinhole only (IGNORE_DISTORTION=1 drops it)")
+    if not getattr(check_pinhole, "warned", False):
+        print(f"[artifixer_gs] IGNORE_DISTORTION=1: {what} distortion {list(distortion)} dropped (pinhole)", file=sys.stderr)
+        check_pinhole.warned = True
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_EPS2D = 0.3
+
+
+def default_eps2d() -> float:
+    return float(os.environ.get("EPS2D") or DEFAULT_EPS2D)
 
 
 def read_ply(path: Path) -> dict[str, np.ndarray]:
@@ -88,24 +113,29 @@ def read_ply(path: Path) -> dict[str, np.ndarray]:
 
 
 def trajectory_cameras(trajectory_path: Path) -> tuple[np.ndarray, np.ndarray, int, int]:
-    """OpenCV world-to-camera matrices [M,4,4] and intrinsics [M,3,3] of a transforms.json path."""
+    """OpenCV world-to-camera matrices [M,4,4] and intrinsics [M,3,3] of a transforms.json path.
+    CENTER_PRINCIPAL_POINT=1 puts the principal point at the image centre (w/2, h/2): the camera model of trainers that
+    ignore COLMAP's cx, cy (3DGS readers, Gaussian Wrapping), so renders and hole_mesh match what they fitted."""
     transforms = json.loads(trajectory_path.read_text())
     applied_transform = applied_transform_matrix(transforms)
     viewmats, Ks, sizes = [], [], set()
     for index, frame in enumerate(transforms["frames"]):
         intrinsics = camera_intrinsics_for_frame(transforms, frame)
-        distortion = [intrinsics[key] for key in DISTORTION_KEYS]
-        assert not any(distortion), f"{trajectory_path} frame {index} has lens distortion {distortion}; 3DGS renders pinhole only"
+        check_pinhole([intrinsics[key] for key in DISTORTION_KEYS], f"{trajectory_path} frame {index}")
         sizes.add((intrinsics["w"], intrinsics["h"]))
         viewmats.append(opengl_c2w_to_opencv_w2c(frame["transform_matrix"], applied_transform))
         Ks.append([[intrinsics["fl_x"], 0, intrinsics["cx"]], [0, intrinsics["fl_y"], intrinsics["cy"]], [0, 0, 1]])
     assert len(sizes) == 1, f"{trajectory_path} must use one resolution, got {sorted(sizes)}"
     width, height = sizes.pop()
-    return np.asarray(viewmats, np.float32), np.asarray(Ks, np.float32), width, height
+    Ks = np.asarray(Ks, np.float32)
+    if os.environ.get("CENTER_PRINCIPAL_POINT") == "1":
+        Ks[:, 0, 2], Ks[:, 1, 2] = width / 2, height / 2
+    return np.asarray(viewmats, np.float32), Ks, width, height
 
 
-def render_frames(ply_path: Path, trajectory_path: Path, out_dir: Path, depth: bool = False) -> None:
+def render_frames(ply_path: Path, trajectory_path: Path, out_dir: Path, depth: bool = False, eps2d: float | None = None) -> None:
     """Rasterize every path frame with gsplat and write the PNGs (needs torch + gsplat)."""
+    eps2d = default_eps2d() if eps2d is None else eps2d
     import torch
     from gsplat import rasterization
     from PIL import Image
@@ -118,7 +148,7 @@ def render_frames(ply_path: Path, trajectory_path: Path, out_dir: Path, depth: b
     for name in (*RENDER_FRAME_DIRS, *(("depth",) if depth else ())):
         (out_dir / name).mkdir(parents=True, exist_ok=True)
 
-    print(f"Rendering {len(viewmats)} frames of {trajectory_path} from {ply_path} ({len(g['means'])} Gaussians, SH {sh_degree})", flush=True)
+    print(f"Rendering {len(viewmats)} frames of {trajectory_path} from {ply_path} ({len(g['means'])} Gaussians, SH {sh_degree}, eps2d {eps2d})", flush=True)
     with torch.no_grad():
         for index in range(len(viewmats)):
             colors, alphas, _ = rasterization(
@@ -134,6 +164,7 @@ def render_frames(ply_path: Path, trajectory_path: Path, out_dir: Path, depth: b
                 sh_degree=sh_degree,
                 render_mode="RGB+ED" if depth else "RGB",
                 rasterize_mode="classic",
+                eps2d=eps2d,
                 backgrounds=torch.zeros(1, 3, device=device),
             )
             rgb = colors[0, ..., :3]
@@ -172,8 +203,10 @@ def render_ply(
     output_dir: Path,
     selected_indices: list[int],
     depth: bool = False,
+    eps2d: float | None = None,
 ) -> Path:
     """Render ply on trajectory_path into output_dir (cleared first) and record selected_indices."""
+    eps2d = default_eps2d() if eps2d is None else eps2d
     ply, trajectory_path, output_dir = ply.resolve(), trajectory_path.resolve(), output_dir.resolve()
     if not ply.is_file():
         raise FileNotFoundError(f"Missing Gaussian PLY: {ply}")
@@ -182,13 +215,19 @@ def render_ply(
             shutil.rmtree(output_dir / name)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if gsplat_available():
-        render_frames(ply, trajectory_path, output_dir, depth)
+    render_cmd = os.environ.get("RENDER_CMD", "").strip()
+    if render_cmd:  # another rasterizer (e.g. Gaussian Wrapping's render_ours), same output contract
+        env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
+        command = shlex.split(render_cmd) + ["--ply", str(ply), "--trajectory", str(trajectory_path), "--out_dir", str(output_dir)]
+        subprocess.run(command + (["--depth"] if depth else []), check=True, env=env, cwd=os.environ.get("RENDER_CWD") or REPO_ROOT)
+    elif gsplat_available():
+        render_frames(ply, trajectory_path, output_dir, depth, eps2d)
     else:
         python = os.environ.get("GS_RENDER_PY")
         assert python, "gsplat is not importable here: set GS_RENDER_PY to a Python that has torch + gsplat"
         env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(REPO_ROOT), os.environ.get("PYTHONPATH", "")])}
-        command = [python, "-m", "artifixer_gs.render", "--ply", str(ply), "--trajectory", str(trajectory_path), "--out_dir", str(output_dir)]
+        command = [python, "-m", "artifixer_gs.render", "--ply", str(ply), "--trajectory", str(trajectory_path), "--out_dir", str(output_dir),
+                   "--eps2d", repr(eps2d)]
         subprocess.run(command + (["--depth"] if depth else []), check=True, env=env, cwd=REPO_ROOT)
 
     frame_count = len(read_camera_trajectory(trajectory_path)["frames"])
@@ -203,8 +242,10 @@ def main() -> None:
     parser.add_argument("--trajectory", type=Path, required=True, help="transforms.json-style camera path (OpenGL c2w).")
     parser.add_argument("--out_dir", type=Path, required=True)
     parser.add_argument("--depth", action="store_true", help="Also write depth/{i:05d}.npy (expected z-depth).")
+    parser.add_argument("--eps2d", type=float, default=None,
+                        help=f"2D covariance low-pass (default: $EPS2D, else {DEFAULT_EPS2D}; 0 for Gaussian Wrapping PLYs).")
     args = parser.parse_args()
-    render_frames(args.ply.resolve(), args.trajectory.resolve(), args.out_dir.resolve(), args.depth)
+    render_frames(args.ply.resolve(), args.trajectory.resolve(), args.out_dir.resolve(), args.depth, args.eps2d)
 
 
 if __name__ == "__main__":

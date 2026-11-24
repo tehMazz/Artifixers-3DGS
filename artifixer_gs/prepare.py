@@ -14,6 +14,10 @@ are rendered with gsplat. Phases:
   scale    metric scale with MoGe-2 (or --metric_scale)
   caption  caption.h5 from --caption text, or the Qwen3-VL captioner
 
+--images picks the photo folder (images_4, ...): the cameras are scaled to its image size, so use the
+folder the PLY was trained on. --phases prepare,scale,caption (no render) is the start of the object
+removal flow: artifixer_gs.removal renders the object-free PLY on input/<id>/nerfstudio/transforms.json.
+
 The PLY must live in the world frame of --colmap_dir (true when it was trained on that COLMAP).
 split.json is written once renders, scale and caption exist; model_eval.run_inference reads it.
 """
@@ -103,9 +107,9 @@ def prepared_paths(scene_root: Path, scene_id: str) -> PreparedPaths:
     )
 
 
-def resolve_colmap_paths(colmap_dir: Path) -> tuple[Path, Path]:
+def resolve_colmap_paths(colmap_dir: Path, images: str = "images") -> tuple[Path, Path]:
     colmap_dir = colmap_dir.resolve()
-    image_dir = colmap_dir / "images"
+    image_dir = colmap_dir / images
     sparse_dir = colmap_dir / "sparse" / "0"
     if not image_dir.is_dir():
         raise FileNotFoundError(f"Missing COLMAP images directory: {image_dir}")
@@ -564,8 +568,9 @@ def run_metric_alignment(args: argparse.Namespace, paths: PreparedPaths) -> None
     from data_processing.sparse_recon.metric_alignment import align_colmap_to_metric_scale
 
     paths.scale_dir.mkdir(parents=True, exist_ok=True)
+    # The prepared sparse/0 has its cameras scaled to the prepared photos (--images, downscale).
     scale, _, _ = align_colmap_to_metric_scale(
-        colmap_dir=args.colmap_dir / "sparse/0",
+        colmap_dir=paths.input_dir / "sparse/0",
         image_dir=paths.input_dir / "images",
         output_dir=paths.scale_dir,
         debug=False,
@@ -576,20 +581,9 @@ def run_metric_alignment(args: argparse.Namespace, paths: PreparedPaths) -> None
 
 def write_fixed_caption(caption: str, output_path: Path, text_encoder_model_id: str, max_sequence_length: int = 512) -> None:
     """caption.h5 from a given caption string, in generate_caption_hdf5's on-disk format."""
-    import h5py
-    import torch
+    from artifixer_gs.caption import write_caption
 
-    from data_processing.captioning.generate_captions import generate_text_embedding, get_text_encoder_and_tokenizer
-
-    text_encoder, tokenizer = get_text_encoder_and_tokenizer(text_encoder_model_id)
-    with torch.inference_mode():
-        embedding = generate_text_embedding(caption, text_encoder, tokenizer, max_sequence_length)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with h5py.File(output_path, "w") as hf:
-        dataset = hf.create_dataset("frame_00000", data=embedding)
-        dataset.attrs["caption"] = caption
-        dataset.attrs["image_indices"] = np.array([0])
-    print(f"Wrote {output_path} embedding={embedding.shape}", flush=True)
+    write_caption(caption, output_path, text_encoder_model_id, max_sequence_length)
 
 
 def generate_caption(args: argparse.Namespace, paths: PreparedPaths) -> None:
@@ -638,6 +632,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="COLMAP scene the PLY was trained on: images/ and sparse/0/{cameras,images,points3D}.bin.",
     )
     parser.add_argument(
+        "--images",
+        default="images",
+        help="Photo folder inside --colmap_dir (e.g. images_4): the one the PLY was trained on.",
+    )
+    parser.add_argument(
         "--output_root", type=Path, required=True, help="Scene output directory. Its name is the scene id."
     )
     parser.add_argument(
@@ -684,7 +683,7 @@ def prepare_scene(args: argparse.Namespace) -> None:
     if args.trajectory_path is not None:
         args.trajectory_path = args.trajectory_path.expanduser().resolve()
         assert "render" in phases, "--trajectory_path requires the render phase"
-    image_dir, sparse_dir = resolve_colmap_paths(args.colmap_dir)
+    image_dir, sparse_dir = resolve_colmap_paths(args.colmap_dir, args.images)
     scene = read_colmap_scene(sparse_dir)
     require_unique_basenames(scene.images)
     scene = scale_colmap_scene_to_images(image_dir, scene)
